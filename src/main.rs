@@ -38,8 +38,8 @@ async fn main() {
 
     let port = std::env::var("PORT").expect("there is no specified port");
 
-    let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await.unwrap();
-    println!("🚀 Server running on http://127.0.0.1:3000");
+    let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
+    println!("🚀 Server running on http://0.0.0.0:3000");
     println!("📍 Endpoints:");
     println!("   GET / - API info");
     println!("   GET /sui-move-users?limit=10 - Fetch Sui Move developers");
