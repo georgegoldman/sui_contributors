@@ -36,7 +36,9 @@ async fn main() {
         .route("/", get(root))
         .route("/sui-move-users", get(get_sui_move_users));
 
-    let listener = TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    let port = std::env::var("PORT").expect("there is no specified port");
+
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await.unwrap();
     println!("🚀 Server running on http://127.0.0.1:3000");
     println!("📍 Endpoints:");
     println!("   GET / - API info");
