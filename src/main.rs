@@ -17,7 +17,7 @@ struct SearchParams {
 
 #[derive(Debug, Deserialize)]
 struct CodeSearchResult {
-    total_count: Option<u32>, // GitHub sometimes hides this (null)
+    total_count: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,6 +49,28 @@ struct Contributor {
     contributions: u32,
 }
 
+#[derive(Debug, Deserialize)]
+struct Commit {
+    commit: CommitDetails,
+    author: Option<CommitAuthor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitDetails {
+    author: CommitUserDetails,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitUserDetails {
+    name: String,
+    email: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitAuthor {
+    login: String,
+}
+
 #[derive(Debug, Serialize)]
 struct UserResponse {
     login: String,
@@ -56,6 +78,22 @@ struct UserResponse {
     profile_url: String,
     total_contributions: u32,
     repositories: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RepositoryWithCommits {
+    repo_name: String,
+    repo_url: String,
+    commit_count: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct UserMoveFilesResponse {
+    username: String,
+    has_move_files: bool,
+    total_repositories: usize,
+    total_commits: u32,
+    repositories: Vec<RepositoryWithCommits>,
 }
 
 // ------------------- Defaults -------------------
@@ -101,7 +139,7 @@ async fn root() -> Json<serde_json::Value> {
         "service": "Sui Move GitHub Users API",
         "endpoints": {
             "/sui-move-users": "Get GitHub users who have written Sui Move code",
-            "/check-sui-developer?username=<github_user>": "Check if a specific GitHub user has .move files"
+            "/check-sui-developer?username=<github_user>": "Check if a specific GitHub user has .move files with repo and commit details"
         },
         "example": "/sui-move-users?limit=10"
     }))
@@ -111,47 +149,203 @@ async fn check_sui_developer_handler(
     Query(params): Query<DeveloperQuery>,
     Extension(client): Extension<Client>,
     Extension(token): Extension<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<UserMoveFilesResponse>, (StatusCode, String)> {
     let username = &params.username;
 
-    match user_has_move_file(&client, &token, username).await {
-        Ok(true) => Ok(Json(serde_json::json!({"username": username, "has_move_files": true}))),
-        Ok(false) => Ok(Json(serde_json::json!({"username": username, "has_move_files": false}))),
+    match get_user_move_repos(&client, &token, username).await {
+        Ok(response) => Ok(Json(response)),
         Err(e) => Err((StatusCode::BAD_GATEWAY, e.to_string())),
     }
 }
 
 // ------------------- Helper Functions -------------------
 
-async fn user_has_move_file(
+async fn get_user_move_repos(
     client: &Client,
     token: &str,
     username: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let url = format!(
-        "https://api.github.com/search/code?q=extension:move+user:{}&per_page=1",
-        username
-    );
+) -> Result<UserMoveFilesResponse, Box<dyn std::error::Error>> {
+    // Step 1: Get ALL user repositories (not limited by code search)
+    let mut all_user_repos = Vec::new();
+    let mut page = 1;
+    
+    loop {
+        let url = format!(
+            "https://api.github.com/users/{}/repos?per_page=100&page={}",
+            username, page
+        );
 
-    let resp = client
-        .get(&url)
+        let resp = client
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "Move-Scanner")
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await?;
+
+        if let Err(e) = resp.error_for_status_ref() {
+            let body = resp.text().await.unwrap_or_else(|_| "<failed to read body>".to_string());
+            let status_str = e.status()
+                .map(|s| s.as_u16().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            return Err(format!("GitHub API error {}: {}", status_str, body).into());
+        }
+
+        let repos: Vec<Repository> = resp.json().await?;
+        
+        if repos.is_empty() {
+            break;
+        }
+
+        all_user_repos.extend(repos);
+        page += 1;
+        
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+
+    // Step 2: Check each repository for .move files
+    let mut repos_with_move_files = Vec::new();
+    
+    for repo in all_user_repos {
+        if repo_has_move_files(client, token, &repo.full_name).await? {
+            repos_with_move_files.push(repo.full_name);
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+    }
+
+    // Step 3: Get commit counts for repositories with .move files
+    let mut repositories_with_commits = Vec::new();
+    let mut total_commits = 0u32;
+
+    for repo_name in &repos_with_move_files {
+        let commit_count = get_user_commit_count(client, token, repo_name, username).await?;
+        
+        repositories_with_commits.push(RepositoryWithCommits {
+            repo_name: repo_name.clone(),
+            repo_url: format!("https://github.com/{}", repo_name),
+            commit_count,
+        });
+        
+        total_commits += commit_count;
+        
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+
+    // Sort by commit count descending
+    repositories_with_commits.sort_by(|a, b| b.commit_count.cmp(&a.commit_count));
+
+    Ok(UserMoveFilesResponse {
+        username: username.to_string(),
+        has_move_files: !repositories_with_commits.is_empty(),
+        total_repositories: repositories_with_commits.len(),
+        total_commits,
+        repositories: repositories_with_commits,
+    })
+}
+
+async fn repo_has_move_files(
+    client: &Client,
+    token: &str,
+    repo_name: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    // Use the Git Trees API to recursively check for .move files
+    // First, get the default branch
+    let repo_url = format!("https://api.github.com/repos/{}", repo_name);
+    
+    let repo_resp = client
+        .get(&repo_url)
         .header("Accept", "application/vnd.github+json")
         .header("User-Agent", "Move-Scanner")
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?;
 
-    if let Err(e) = resp.error_for_status_ref() {
-        let body = resp.text().await.unwrap_or_else(|_| "<failed to read body>".to_string());
-        let status_str = e.status()
-            .map(|s| s.as_u16().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        return Err(format!("GitHub API error {}: {}", status_str, body).into());
+    if !repo_resp.status().is_success() {
+        return Ok(false);
     }
 
-    let result: CodeSearchResult = resp.json().await?;
-    Ok(matches!(result.total_count, Some(c) if c > 0))
+    let repo_data: serde_json::Value = repo_resp.json().await?;
+    let default_branch = repo_data["default_branch"]
+        .as_str()
+        .unwrap_or("main");
+
+    // Get the tree recursively
+    let tree_url = format!(
+        "https://api.github.com/repos/{}/git/trees/{}?recursive=1",
+        repo_name, default_branch
+    );
+
+    let tree_resp = client
+        .get(&tree_url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "Move-Scanner")
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await?;
+
+    if !tree_resp.status().is_success() {
+        return Ok(false);
+    }
+
+    let tree_data: serde_json::Value = tree_resp.json().await?;
+    
+    // Check if any file ends with .move
+    if let Some(tree) = tree_data["tree"].as_array() {
+        for item in tree {
+            if let Some(path) = item["path"].as_str() {
+                if path.ends_with(".move") {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+async fn get_user_commit_count(
+    client: &Client,
+    token: &str,
+    repo_name: &str,
+    username: &str,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    let mut total_commits = 0u32;
+    let mut page = 1;
+
+    loop {
+        let url = format!(
+            "https://api.github.com/repos/{}/commits?author={}&per_page=100&page={}",
+            repo_name, username, page
+        );
+
+        let resp = client
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "Move-Scanner")
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            // If we can't get commits (e.g., repo is private or deleted), return 0
+            break;
+        }
+
+        let commits: Vec<Commit> = resp.json().await?;
+        
+        // Break when no more commits
+        if commits.is_empty() {
+            break;
+        }
+
+        total_commits += commits.len() as u32;
+        page += 1;
+
+        // Continue fetching ALL pages until exhausted (no artificial limit)
+    }
+
+    Ok(total_commits)
 }
 
 // ------------------- Sui Move Users -------------------
