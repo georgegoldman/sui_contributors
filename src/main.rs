@@ -47,7 +47,7 @@ async fn main() {
 
     let app_cors = CorsLayer::new()
     .allow_methods([Method::GET, Method::POST])
-    .allow_origin("https://www.suiref.xyz/".parse::<HeaderValue>().unwrap())
+    .allow_origin("https://www.suiref.xyz".parse::<HeaderValue>().unwrap())
     // .allow_origin(Any)
     .allow_headers([AUTHORIZATION, CONTENT_TYPE])
     ; // enabled cors for only this endpoint
