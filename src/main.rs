@@ -47,7 +47,7 @@ async fn main() {
 
     let app_cors = CorsLayer::new()
     .allow_methods([Method::GET, Method::POST])
-    .allow_origin(Any);
+    .allow_origin("https://www.suiref.xyz/");
 
     let app = Router::new()
         .route("/", get(root))
