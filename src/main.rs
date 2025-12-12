@@ -1,8 +1,9 @@
 use axum::{
-    extract::Query, http::StatusCode, response::Json, routing::get, Extension, Router,
+    extract::Query, http::{StatusCode, header::{AUTHORIZATION, CONTENT_TYPE}}, response::Json, routing::get, Extension, Router,
 };
+use tower_http::cors::{Any, CorsLayer};
 use dotenv::dotenv;
-use reqwest::Client;
+use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use tokio::net::TcpListener;
@@ -44,10 +45,15 @@ async fn main() {
         .build()
         .expect("Failed to build reqwest client");
 
+    let app_cors = CorsLayer::new()
+    .allow_methods([Method::GET, Method::POST])
+    .allow_origin(Any);
+
     let app = Router::new()
         .route("/", get(root))
         .route("/check-sui-developer", get(check_sui_developer_handler))
         .layer(Extension(client))
+        .layer(app_cors)
         .layer(Extension(github_token));
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
