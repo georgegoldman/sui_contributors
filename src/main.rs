@@ -1,5 +1,5 @@
 use axum::{
-    extract::Query, http::{StatusCode, header::{AUTHORIZATION, CONTENT_TYPE}}, response::Json, routing::get, Extension, Router,
+    Extension, Router, extract::Query, http::{HeaderValue, StatusCode, header::{AUTHORIZATION, CONTENT_TYPE}}, response::Json, routing::get
 };
 use tower_http::cors::{Any, CorsLayer};
 use dotenv::dotenv;
@@ -47,7 +47,9 @@ async fn main() {
 
     let app_cors = CorsLayer::new()
     .allow_methods([Method::GET, Method::POST])
-    .allow_origin("https://www.suiref.xyz/");
+    .allow_origin("https://www.suiref.xyz/".parse::<HeaderValue>().unwrap())
+    .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+    ; // enabled cors for only this endpoint
 
     let app = Router::new()
         .route("/", get(root))
